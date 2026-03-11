@@ -1,0 +1,15 @@
+# UAV 3-D Simulation — Python Dependencies
+# Tested on Python 3.10 / 3.11 / Streamlit Cloud
+
+# --- Core web framework ---
+streamlit>=1.35.0
+
+# --- Numerical computing ---
+numpy>=1.24.0
+scipy>=1.11.0
+
+# --- Interactive 3-D / 2-D visualisation ---
+plotly>=5.20.0
+
+# --- Data processing & export ---
+pandas>=2.0.0
