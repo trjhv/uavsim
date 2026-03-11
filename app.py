@@ -29,11 +29,12 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 
-from simulation.drone import DronePhysics, DroneState
-from simulation.environment import Environment
-from simulation.path_planner import AStarPlanner3D
-from simulation.lidar import LiDARSensor
-from simulation.visualization import build_3d_scene
+# --- UPDATED IMPORTS FOR FLAT FOLDER STRUCTURE ---
+from drone import DronePhysics, DroneState
+from environment import Environment
+from path_planner import AStarPlanner3D
+from lidar import LiDARSensor
+from visualization import build_3d_scene
 
 
 # ===========================================================================
