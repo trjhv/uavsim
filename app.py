@@ -1,973 +1,896 @@
 """
-app.py — UAV 3-D Simulation & Mission Planning Dashboard
-=========================================================
-A production-grade Streamlit application that provides:
+app.py — SAR UAV Multi-Drone Simulation Dashboard
+===================================================
+Urban Flood Search & Rescue with Hybrid APF-PSO-Vortex Navigation
 
-  ┌─ SIDEBAR ──────────────────────────────────────────────────────────┐
-  │  • Drone hardware parameters (mass, speed, battery)                │
-  │  • Environment generation (size, obstacle density, seed)           │
-  │  • Mission endpoints (start/goal altitude, flight altitude)        │
-  │  • Sensor configuration (LiDAR toggle, range, resolution)         │
-  │  • Physics options (wind model, safety margin, timestep)           │
-  │  • Run / Reset simulation controls                                 │
-  └────────────────────────────────────────────────────────────────────┘
+Deploy: streamlit run app.py
+GitHub: Place all files in repo root; Streamlit Cloud deploys automatically.
 
-  ┌─ MAIN TABS ────────────────────────────────────────────────────────┐
-  │  Tab 1 — 3D Mission View    : Full Plotly 3-D scene with scrubber  │
-  │  Tab 2 — Telemetry          : Altitude, speed, battery time-series │
-  │  Tab 3 — Collision Monitor  : Proximity alerts, NFZ violations     │
-  │  Tab 4 — Mission Report     : Statistics and flight log            │
-  └────────────────────────────────────────────────────────────────────┘
+Three-panel layout:
+  ┌────────────────────────────┬──────────────────────┐
+  │                            │  TACTICAL MAP        │
+  │   MAIN 3D SCENE            │  (top-down, FPV)     │
+  │   Full isometric world     ├──────────────────────┤
+  │   + drone models + trails  │  LiDAR + APF FIELD   │
+  │                            │  (sensor panel)      │
+  └────────────────────────────┴──────────────────────┘
 
-Dependencies: streamlit, plotly, numpy, scipy
+Keyboard control (UAV-1):
+  WASD / Arrow keys — directional flight
+  R / Space — Ascend    |    F / Shift — Descend
+  Q — Yaw Left          |    E — Yaw Right
+  H — Hold position     |    TAB — Toggle auto/manual
 """
 
 import time
+import json
+import math
 import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
+from numpy.linalg import norm
 import streamlit as st
+import streamlit.components.v1 as components
 
-# --- UPDATED IMPORTS FOR FLAT FOLDER STRUCTURE ---
-from drone import DronePhysics, DroneState
-from environment import Environment
-from path_planner import AStarPlanner3D
-from lidar import LiDARSensor
-from visualization import build_3d_scene
-
-
-# ===========================================================================
-# PAGE CONFIG — Must be first Streamlit call
-# ===========================================================================
-
-st.set_page_config(
-    page_title="UAV Mission Sim",
-    page_icon="🚁",
-    layout="wide",
-    initial_sidebar_state="expanded",
+# ── Simulation modules ────────────────────────────────────────────────────────
+from simulation.environment import (
+    create_flood_scene, get_all_obstacle_centers,
+    FloodScene, DRONE_STARTS, DETECTION_RADIUS, FLOOD_Z,
+    WORLD_X, WORLD_Y
+)
+from simulation.drone        import DroneState, DronePhysics, create_drone_state
+from simulation.algorithms   import (
+    PSOSwarm, compute_hybrid_force, compute_manual_force,
+    select_target, DETECTION_RADIUS as _
+)
+from simulation.lidar        import LiDARSensor
+from simulation.visualization import (
+    build_main_scene, build_tactical_map, build_sensor_panel
 )
 
 
-# ===========================================================================
-# CUSTOM CSS — Aerospace HUD aesthetic
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PAGE CONFIGURATION — must be first Streamlit call
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.set_page_config(
+    page_title  = "SAR UAV Sim | APF-PSO-Vortex",
+    page_icon   = "🚁",
+    layout      = "wide",
+    initial_sidebar_state = "expanded",
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GLOBAL CSS — Military HUD aesthetic
+#  Font: "Share Tech Mono" (sci-fi monospace) + "Barlow Condensed" (titles)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 st.markdown("""
 <style>
-  /* --- Import monospace font --- */
-  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700;900&display=swap');
 
-  /* --- Global dark background --- */
-  .stApp { background-color: #05050F; color: #CBD5E1; }
-  .main .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+/* ── Base ── */
+.stApp { background-color: #030A12; color: #8FBAD0; }
+.main .block-container { padding: 0.6rem 0.8rem 0.8rem 0.8rem; }
 
-  /* --- Sidebar styling --- */
-  section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0A0A1E 0%, #070714 100%);
-    border-right: 1px solid #1E3A5F;
-  }
+/* ── Sidebar ── */
+section[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, #040D18 0%, #030A12 100%);
+  border-right: 1px solid #0A2540;
+}
+section[data-testid="stSidebar"] * { font-family: 'Share Tech Mono', monospace !important; }
 
-  /* --- HUD metric cards --- */
-  [data-testid="stMetric"] {
-    background: rgba(14, 20, 40, 0.85);
-    border: 1px solid #1E40AF;
-    border-radius: 6px;
-    padding: 8px 12px !important;
-    backdrop-filter: blur(4px);
-    font-family: 'Share Tech Mono', monospace;
-  }
-  [data-testid="stMetricLabel"] { color: #64748B !important; font-size: 0.72rem !important; text-transform: uppercase; letter-spacing: 0.08em; }
-  [data-testid="stMetricValue"] { color: #00D4FF !important; font-size: 1.3rem !important; font-family: 'Share Tech Mono', monospace !important; }
-  [data-testid="stMetricDelta"] { font-size: 0.72rem !important; }
+/* ── Metric cards ── */
+[data-testid="stMetric"] {
+  background: rgba(8,20,40,0.90);
+  border: 1px solid #0A3060;
+  border-radius: 3px;
+  padding: 6px 10px !important;
+}
+[data-testid="stMetricLabel"] {
+  color: #2E5A80 !important; font-size: 0.64rem !important;
+  text-transform: uppercase; letter-spacing: 0.12em;
+  font-family: 'Share Tech Mono', monospace !important;
+}
+[data-testid="stMetricValue"] {
+  color: #00C8FF !important; font-size: 1.15rem !important;
+  font-family: 'Share Tech Mono', monospace !important;
+}
+[data-testid="stMetricDelta"] { font-size: 0.65rem !important; }
 
-  /* --- Tabs --- */
-  [data-testid="stTabs"] button {
-    font-family: 'Exo 2', sans-serif;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    color: #64748B;
-    border-bottom: 2px solid transparent;
-  }
-  [data-testid="stTabs"] button[aria-selected="true"] {
-    color: #00D4FF;
-    border-bottom: 2px solid #00D4FF;
-  }
+/* ── Buttons ── */
+.stButton > button {
+  background: linear-gradient(135deg, #0A2040, #061428);
+  border: 1px solid #1A4880;
+  color: #00C8FF;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.82rem;
+  letter-spacing: 0.06em;
+  border-radius: 3px;
+  padding: 4px 12px;
+  transition: all 0.15s;
+  width: 100%;
+}
+.stButton > button:hover {
+  background: linear-gradient(135deg, #1A4880, #0A2040);
+  border-color: #00C8FF;
+  box-shadow: 0 0 10px rgba(0,200,255,0.3);
+}
+.stButton > button:active {
+  background: #00C8FF;
+  color: #030A12;
+  box-shadow: 0 0 20px rgba(0,200,255,0.6);
+}
 
-  /* --- Buttons --- */
-  .stButton > button {
-    width: 100%;
-    background: linear-gradient(135deg, #1E3A5F, #0F1F3D);
-    border: 1px solid #2563EB;
-    color: #00D4FF;
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 0.9rem;
-    letter-spacing: 0.06em;
-    border-radius: 4px;
-    transition: all 0.2s;
-  }
-  .stButton > button:hover {
-    background: linear-gradient(135deg, #2563EB, #1E3A5F);
-    border-color: #00D4FF;
-    box-shadow: 0 0 12px rgba(0, 212, 255, 0.35);
-  }
+/* ── Sliders ── */
+[data-testid="stSlider"] > div > div { background: #1A4880 !important; }
+[data-testid="stSlider"] > div > div > div { background: #00C8FF !important; }
 
-  /* --- Sliders --- */
-  [data-testid="stSlider"] > div > div { background-color: #1E40AF; }
-  [data-testid="stSlider"] > div > div > div { background: #00D4FF; }
+/* ── Toggle ── */
+[data-testid="stCheckbox"] span { color: #8FBAD0; }
 
-  /* --- Section headers in sidebar --- */
-  .sidebar-header {
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 0.68rem;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: #00D4FF;
-    border-bottom: 1px solid #1E40AF;
-    padding-bottom: 4px;
-    margin-bottom: 10px;
-    margin-top: 16px;
-  }
+/* ── Section dividers ── */
+hr { border-color: #0A2540 !important; }
 
-  /* --- Alert boxes --- */
-  .alert-danger {
-    background: rgba(220, 38, 38, 0.12);
-    border-left: 3px solid #DC2626;
-    padding: 8px 12px;
-    border-radius: 4px;
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 0.82rem;
-    color: #FCA5A5;
-    margin: 4px 0;
-  }
-  .alert-warning {
-    background: rgba(245, 158, 11, 0.12);
-    border-left: 3px solid #F59E0B;
-    padding: 8px 12px;
-    border-radius: 4px;
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 0.82rem;
-    color: #FDE68A;
-    margin: 4px 0;
-  }
-  .alert-ok {
-    background: rgba(16, 185, 129, 0.10);
-    border-left: 3px solid #10B981;
-    padding: 8px 12px;
-    border-radius: 4px;
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 0.82rem;
-    color: #6EE7B7;
-    margin: 4px 0;
-  }
+/* ── D-PAD keyboard control widget ── */
+.dpad-container {
+  display: grid;
+  grid-template-areas:
+    ". up ."
+    "left stop right"
+    ". down .";
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+  width: 120px;
+  margin: 0 auto;
+}
+.dpad-btn {
+  background: linear-gradient(145deg, #0E2A45, #071A30);
+  border: 1px solid #1A4880;
+  border-radius: 4px;
+  color: #00C8FF;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.75rem;
+  padding: 6px 0;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.1s;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.dpad-btn:hover { border-color: #00C8FF; box-shadow: 0 0 8px rgba(0,200,255,0.4); }
+.dpad-btn:active { background: #00C8FF; color: #030A12; }
+.dpad-btn.active { background: #00C8FF !important; color: #030A12 !important; box-shadow: 0 0 12px rgba(0,200,255,0.7); }
 
-  /* --- Status badge --- */
-  .status-badge {
-    display: inline-block;
-    padding: 2px 10px;
-    border-radius: 20px;
-    font-size: 0.75rem;
-    font-family: 'Share Tech Mono', monospace;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-  }
+/* ── Panel title bars ── */
+.panel-title {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-weight: 700;
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: #1A6090;
+  border-bottom: 1px solid #0A3060;
+  padding-bottom: 3px;
+  margin-bottom: 4px;
+}
 
-  /* --- HUD title --- */
-  .hud-title {
-    font-family: 'Exo 2', sans-serif;
-    font-size: 1.6rem;
-    font-weight: 700;
-    color: #00D4FF;
-    letter-spacing: 0.04em;
-    text-shadow: 0 0 20px rgba(0, 212, 255, 0.5);
-  }
-  .hud-subtitle {
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 0.75rem;
-    color: #475569;
-    letter-spacing: 0.08em;
-  }
+/* ── Status badges ── */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 2px;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.badge-ok   { background: rgba(0,180,80,0.15); color: #00E060; border: 1px solid #00A040; }
+.badge-warn { background: rgba(255,140,0,0.15); color: #FFA020; border: 1px solid #CC6600; }
+.badge-crit { background: rgba(220,20,30,0.15); color: #FF3040; border: 1px solid #CC1020; }
+.badge-info { background: rgba(0,160,220,0.15); color: #00C8FF; border: 1px solid #006090; }
+
+/* ── Alert box ── */
+.alert-box {
+  padding: 6px 10px;
+  border-radius: 3px;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.72rem;
+  margin: 3px 0;
+}
+.alert-found { background: rgba(0,200,80,0.12); border-left: 3px solid #00C050; color: #60FF90; }
+.alert-warn  { background: rgba(255,120,0,0.12); border-left: 3px solid #FF7000; color: #FFAA40; }
+
+/* ── App title ── */
+.app-title {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-weight: 900;
+  font-size: 1.45rem;
+  letter-spacing: 0.08em;
+  color: #00C8FF;
+  text-shadow: 0 0 20px rgba(0,200,255,0.45);
+  line-height: 1.1;
+}
+.app-sub {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.62rem;
+  color: #2A5A80;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+/* ── Progress bar custom ── */
+.stProgress > div > div > div > div {
+  background: linear-gradient(90deg, #006090, #00C8FF) !important;
+}
+
+/* ── Hide Streamlit branding ── */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
 
-# ===========================================================================
-# SESSION STATE INITIALISATION
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+#  KEYBOARD LISTENER — JavaScript injection
+#  Captures WASD/Arrow key presses from the browser and stores them in
+#  the Streamlit session via a hidden text_input.
+#  Works in all modern browsers; updates every 80ms via polling.
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def init_session():
-    defaults = dict(
-        sim_run=False,
-        states=[],
-        path=[],
-        environment=None,
-        frame_idx=0,
-        lidar_cache={},    # frame_idx → (points, intensities)
-        plan_time=0.0,
-        sim_time=0.0,
-    )
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+KEYBOARD_JS = """
+<script>
+(function() {
+  // Avoid double-injection
+  if (window._sarKeysInit) return;
+  window._sarKeysInit = true;
+  window._sarActiveKeys = {};
 
-init_session()
+  const TRACKED = new Set(['w','a','s','d','q','e','r','f','h',
+    'arrowup','arrowdown','arrowleft','arrowright',' ','shift','tab']);
+
+  document.addEventListener('keydown', function(e) {
+    const k = e.key.toLowerCase();
+    if (TRACKED.has(k)) {
+      e.preventDefault();
+      window._sarActiveKeys[k] = 1;
+    }
+  });
+
+  document.addEventListener('keyup', function(e) {
+    delete window._sarActiveKeys[e.key.toLowerCase()];
+  });
+
+  // Poll and inject into the hidden text input every 80ms
+  setInterval(function() {
+    const keys = Object.keys(window._sarActiveKeys).join(',');
+    // Find our specific hidden input by placeholder attribute
+    const allInputs = window.parent.document.querySelectorAll('input[type="text"]');
+    for (const inp of allInputs) {
+      if (inp.getAttribute('placeholder') === '__sar_keys__') {
+        if (inp.value !== keys) {
+          const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value').set;
+          setter.call(inp, keys);
+          inp.dispatchEvent(new Event('input', {bubbles: true}));
+        }
+        break;
+      }
+    }
+  }, 80);
+})();
+</script>
+"""
 
 
-# ===========================================================================
-# WIND MODEL
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SESSION STATE — Initialise all simulation state on first run
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def make_wind_fn(intensity: float, direction_deg: float):
-    """Return a callable wind_fn(t) → force vector."""
-    if intensity == 0:
-        return None
-    dir_rad = np.deg2rad(direction_deg)
-    base = np.array([
-        intensity * np.cos(dir_rad),
-        intensity * np.sin(dir_rad),
-        0.0,
-    ])
-    def wind_fn(t):
-        # Add turbulence: Dryden-inspired sinusoidal gusts
-        gust = 0.3 * intensity * np.array([
-            np.sin(0.5 * t + 1.2),
-            np.sin(0.7 * t + 2.4),
-            np.sin(0.3 * t) * 0.3,
-        ])
-        return base + gust
-    return wind_fn
+@st.cache_resource
+def _get_scene_and_obstacles():
+    """Cache the flood scene (never changes between reruns)."""
+    scene = create_flood_scene(seed=42)
+    obstacles = get_all_obstacle_centers(scene)
+    return scene, obstacles
 
 
-# ===========================================================================
-# SIDEBAR
-# ===========================================================================
+@st.cache_resource
+def _get_lidar():
+    return LiDARSensor(n_horizontal=72, n_vertical=16,
+                       fov_vert_deg=30, range_max=25, noise_std=0.08)
+
+
+def _init_session():
+    """Initialise session state on first load."""
+    scene, obstacles = _get_scene_and_obstacles()
+
+    if "drones" not in st.session_state:
+        st.session_state.drones = [create_drone_state(i) for i in range(3)]
+
+    if "physics" not in st.session_state:
+        st.session_state.physics = [
+            DronePhysics(st.session_state.drones[i])
+            for i in range(3)
+        ]
+
+    if "pso" not in st.session_state:
+        surv_positions = [s.position for s in scene.survivors]
+        st.session_state.pso = [
+            PSOSwarm(DRONE_STARTS[i], surv_positions, seed=i*7)
+            for i in range(3)
+        ]
+
+    if "found_idx" not in st.session_state:
+        st.session_state.found_idx = set()
+
+    if "sim_running" not in st.session_state:
+        st.session_state.sim_running = False
+
+    if "frame_count" not in st.session_state:
+        st.session_state.frame_count = 0
+
+    if "sim_speed" not in st.session_state:
+        st.session_state.sim_speed = 1.0
+
+    if "dt" not in st.session_state:
+        st.session_state.dt = 0.08
+
+    if "lidar_pts" not in st.session_state:
+        st.session_state.lidar_pts   = None
+        st.session_state.lidar_dists = None
+
+    if "lidar_frame_counter" not in st.session_state:
+        st.session_state.lidar_frame_counter = 0
+
+    if "active_keys" not in st.session_state:
+        st.session_state.active_keys = set()
+
+    if "manual_mode" not in st.session_state:
+        st.session_state.manual_mode = True   # Drone 0 manual by default
+
+    if "mission_start_time" not in st.session_state:
+        st.session_state.mission_start_time = None
+
+    if "alerts" not in st.session_state:
+        st.session_state.alerts = []
+
+    if "cam_eye" not in st.session_state:
+        st.session_state.cam_eye = dict(x=-0.8, y=-1.6, z=0.9)
+
+
+_init_session()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SIMULATION STEP — Runs on every Streamlit rerun when sim_running=True
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def simulation_step():
+    """
+    One simulation tick: update all 3 drones.
+
+      1. Parse keyboard input → drone 0 force (if in manual mode)
+      2. Run PSO swarm step for each autonomous drone
+      3. Compute hybrid APF-PSO-Vortex force for each autonomous drone
+      4. Apply physics integration to all drones
+      5. Check survivor detection
+      6. Update LiDAR (every 4 frames for performance)
+    """
+    scene, obstacles = _get_scene_and_obstacles()
+    lidar_sensor     = _get_lidar()
+    dt               = st.session_state.dt * st.session_state.sim_speed
+
+    # Increment frame counter
+    st.session_state.frame_count += 1
+
+    # ── Start mission timer on first run ──────────────────────────────────────
+    if st.session_state.mission_start_time is None:
+        st.session_state.mission_start_time = time.time()
+
+    drones   = st.session_state.drones
+    physics_ = st.session_state.physics
+    pso_list = st.session_state.pso
+
+    # ── Collect other-drone positions for separation ──────────────────────────
+    all_positions = [d.position for d in drones]
+
+    # ── Per-drone update ──────────────────────────────────────────────────────
+    for idx, (drone, phys, pso) in enumerate(zip(drones, physics_, pso_list)):
+
+        # ── Manual drone (idx 0 when manual_mode is on) ───────────────────────
+        if idx == 0 and st.session_state.manual_mode:
+            nav_force = compute_manual_force(
+                st.session_state.active_keys,
+                drone.velocity,
+                drone.yaw,
+            )
+            drone.mode = "manual"
+            force_components = None
+
+        else:
+            # ── Autonomous: PSO step + Hybrid APF-PSO-Vortex ──────────────────
+            drone.mode = "autonomous"
+
+            # PSO cross-swarm knowledge sharing (global best from swarm 0)
+            shared_best = pso_list[0].g_best if idx > 0 else None
+            pso.step(shared_g_best=shared_best)
+
+            # Select current search target (nearest unvisited survivor)
+            target_idx = select_target(
+                drone.position,
+                scene.survivors,
+                st.session_state.found_idx,
+            )
+            drone.target_idx = target_idx
+
+            # If all survivors found, return to base
+            if target_idx is None:
+                goal = np.array([42.0, 42.0, 8.0])   # Rescue base
+            else:
+                goal = scene.survivors[target_idx].position.copy()
+                goal[2] = max(goal[2], 8.0)   # Approach from above
+
+            other_pos = [all_positions[j] for j in range(3) if j != idx]
+            nav_force, force_comps = compute_hybrid_force(
+                pos          = drone.position,
+                velocity     = drone.velocity,
+                goal         = goal,
+                obstacles    = obstacles,
+                other_drones = other_pos,
+                pso_g_best   = pso.g_best,
+                alpha        = 0.55,
+                beta         = 0.30,
+                gamma        = 0.15,
+            )
+            force_components = force_comps
+
+        # ── Physics step ──────────────────────────────────────────────────────
+        phys.step(nav_force, dt=dt, force_components=force_components)
+
+    # ── Survivor detection ────────────────────────────────────────────────────
+    newly_found = []
+    for surv in scene.survivors:
+        if surv.idx in st.session_state.found_idx:
+            continue
+        for drone in drones:
+            dist = norm(drone.position - surv.position)
+            if dist < DETECTION_RADIUS:
+                st.session_state.found_idx.add(surv.idx)
+                scene.survivors[surv.idx].found = True
+                newly_found.append(surv.name)
+                # Inform all PSO swarms
+                for pso in pso_list:
+                    pso.mark_visited(surv.idx)
+                break
+
+    if newly_found:
+        for name in newly_found:
+            st.session_state.alerts.insert(0,
+                f"✅  SURVIVOR {name} LOCATED  —  Frame {st.session_state.frame_count}")
+        st.session_state.alerts = st.session_state.alerts[:6]
+
+    # ── LiDAR update (every 4 frames to save compute) ─────────────────────────
+    st.session_state.lidar_frame_counter += 1
+    if st.session_state.lidar_frame_counter % 4 == 0:
+        rng = np.random.RandomState(st.session_state.frame_count)
+        pts, dists = lidar_sensor.scan(
+            drones[0].position, drones[0].yaw, scene, rng=rng
+        )
+        # Add ground returns for visual richness
+        g_pts, g_dists = lidar_sensor.get_ground_returns(drones[0].position, n_rays=80, rng=rng)
+        if len(g_pts) > 0 and len(pts) > 0:
+            pts   = np.vstack([pts, g_pts])
+            dists = np.concatenate([dists, g_dists])
+        st.session_state.lidar_pts   = pts
+        st.session_state.lidar_dists = dists
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SIDEBAR — Mission Control
+# ═══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
     st.markdown(
-        '<div class="hud-title">🚁 UAV SIM</div>'
-        '<div class="hud-subtitle">MISSION CONTROL INTERFACE v2.0</div>',
-        unsafe_allow_html=True,
+        '<div class="app-title">🛩  SAR UAV SIM</div>'
+        '<div class="app-sub">APF · PSO · VORTEX · HYBRID</div>',
+        unsafe_allow_html=True
     )
     st.markdown("---")
 
-    # ── Drone Hardware ────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-header">▶ Drone Hardware</div>', unsafe_allow_html=True)
-    drone_mass      = st.slider("Mass (kg)",        0.5, 5.0,  1.5, 0.1)
-    drone_max_speed = st.slider("Max Speed (m/s)", 2.0, 15.0,  8.0, 0.5)
-    drone_max_thrust= st.slider("Max Thrust (N)",  10.0, 60.0, 35.0, 1.0)
-    drag_coeff      = st.slider("Drag Coefficient",0.05, 0.4,  0.12, 0.01)
-
-    # ── Environment ───────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-header">▶ Environment</div>', unsafe_allow_html=True)
-    env_size     = st.slider("World Size (m)",   30, 120, 60, 5)
-    env_height   = st.slider("Max Altitude (m)", 20,  60, 35, 5)
-    n_cylinders  = st.slider("Cylinder Buildings",  0, 12, 6, 1)
-    n_boxes      = st.slider("Box Structures",       0,  8, 4, 1)
-    n_nfz        = st.slider("No-Fly Zones",         0,  4, 2, 1)
-    env_seed     = st.number_input("Environment Seed", 0, 9999, 42, step=1)
-
-    # ── Mission ───────────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-header">▶ Mission</div>', unsafe_allow_html=True)
-    takeoff_alt  = st.slider("Takeoff Altitude (m)",   1.0, 10.0,  3.0, 0.5)
-    cruise_alt   = st.slider("Cruise Altitude (m)",    5.0, 30.0, 15.0, 1.0)
-    planner_res  = st.slider("Planner Resolution (m)", 0.8,  3.0,  1.5, 0.1)
-    safety_margin= st.slider("Safety Margin (m)",      0.5,  4.0,  1.5, 0.25)
-
-    # ── Weather ───────────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-header">▶ Weather / Wind</div>', unsafe_allow_html=True)
-    wind_intensity = st.slider("Wind Force (N)",   0.0, 8.0, 0.0, 0.5)
-    wind_direction = st.slider("Wind Direction (°)", 0, 359, 45, 5) if wind_intensity > 0 else 45
-
-    # ── LiDAR ─────────────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-header">▶ LiDAR Sensor</div>', unsafe_allow_html=True)
-    lidar_on    = st.toggle("Enable LiDAR", value=True)
-    lidar_range = st.slider("LiDAR Range (m)",       5.0, 40.0, 20.0, 1.0) if lidar_on else 20.0
-    lidar_h_res = st.slider("H-Resolution (rays)",  18, 144,   72,  18)    if lidar_on else 72
-    lidar_v_ch  = st.slider("Vertical Channels",      4,  32,   16,   4)   if lidar_on else 16
-    show_nfz    = st.toggle("Show No-Fly Zones", value=True)
-
-    # ── Simulation ────────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-header">▶ Simulation</div>', unsafe_allow_html=True)
-    sim_dt          = st.select_slider("Timestep (s)", [0.02, 0.05, 0.1, 0.2], value=0.05)
-    lidar_every_n   = st.slider("LiDAR every N frames", 1, 20, 5, 1)
-
-    st.markdown("")
-    run_btn   = st.button("🚀  RUN SIMULATION",   type="primary")
-    reset_btn = st.button("⟳  RESET")
-
-    if reset_btn:
-        for k in ["sim_run", "states", "path", "environment", "frame_idx", "lidar_cache"]:
-            st.session_state[k] = [] if k in ("states", "path") else (
-                {} if k == "lidar_cache" else
-                False if k == "sim_run" else
-                None if k == "environment" else 0
-            )
-        st.rerun()
-
-
-# ===========================================================================
-# SIMULATION ENGINE — triggered by Run button
-# ===========================================================================
-
-if run_btn:
-    with st.spinner("🔧  Building environment…"):
-        env = Environment(bounds=(float(env_size), float(env_size), float(env_height)))
-        env.generate_urban_environment(
-            n_cylinders=n_cylinders,
-            n_boxes=n_boxes,
-            n_nfz=n_nfz,
-            seed=int(env_seed),
-        )
-        st.session_state.environment = env
-
-    with st.spinner("🗺️  Planning path (A*)…"):
-        start = np.array([1.0, 1.0, takeoff_alt])
-        goal  = np.array([env_size - 1.0, env_size - 1.0, takeoff_alt])
-
-        planner = AStarPlanner3D(env, resolution=planner_res, safety_margin=safety_margin)
-        t0 = time.perf_counter()
-        path = planner.plan(start, goal)
-        st.session_state.plan_time = time.perf_counter() - t0
-        st.session_state.path = path
-
-    with st.spinner("⚙️  Running physics simulation…"):
-        drone = DronePhysics(
-            mass=drone_mass,
-            max_speed=drone_max_speed,
-            max_thrust=drone_max_thrust,
-            drag_coeff=drag_coeff,
-        )
-        drone.reset(start)
-
-        wind_fn = make_wind_fn(wind_intensity, wind_direction)
-
-        t0 = time.perf_counter()
-        states = drone.simulate_mission(
-            waypoints=path,
-            dt=sim_dt,
-            wind_fn=wind_fn,
-            arrival_radius=0.8,
-            max_steps_per_wp=800,
-        )
-        st.session_state.sim_time = time.perf_counter() - t0
-        st.session_state.states = states
-        st.session_state.frame_idx = 0
-
-    if lidar_on and states:
-        with st.spinner("📡  Computing LiDAR scans…"):
-            lidar = LiDARSensor(
-                range_max=lidar_range,
-                n_horizontal=lidar_h_res,
-                n_vertical=lidar_v_ch,
-            )
-            lidar_cache = {}
-            rng = np.random.RandomState(0)
-            for i, s in enumerate(states):
-                if i % lidar_every_n == 0:
-                    pts, inten = lidar.scan(s.position, s.yaw, env, rng=rng)
-                    lidar_cache[i] = (pts, inten)
-            st.session_state.lidar_cache = lidar_cache
-
-    st.session_state.sim_run = True
-    st.rerun()
-
-
-# ===========================================================================
-# HEADER
-# ===========================================================================
-
-col_title, col_status = st.columns([3, 1])
-with col_title:
-    st.markdown(
-        '<span class="hud-title">🛩 UAV MISSION SIMULATION</span>  '
-        '<span class="hud-subtitle">3-D ENVIRONMENT · A* PLANNER · LiDAR SENSOR FUSION</span>',
-        unsafe_allow_html=True,
-    )
-
-with col_status:
-    if st.session_state.sim_run and st.session_state.states:
-        n_states = len(st.session_state.states)
-        badge_style = "background:#064E3B;color:#6EE7B7;border:1px solid #10B981;"
-        st.markdown(
-            f'<div style="text-align:right;margin-top:6px;">'
-            f'<span class="status-badge" style="{badge_style}">✔ SIMULATION READY</span><br>'
-            f'<span class="hud-subtitle">{n_states} FRAMES · '
-            f'PLAN {st.session_state.plan_time*1000:.0f}ms · '
-            f'SIM {st.session_state.sim_time*1000:.0f}ms</span></div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        badge_style = "background:#1C1917;color:#78716C;border:1px solid #44403C;"
-        st.markdown(
-            f'<div style="text-align:right;margin-top:6px;">'
-            f'<span class="status-badge" style="{badge_style}">⬤ AWAITING LAUNCH</span></div>',
-            unsafe_allow_html=True,
-        )
-
-st.markdown("---")
-
-
-# ===========================================================================
-# MAIN CONTENT — Only shown after simulation
-# ===========================================================================
-
-if not st.session_state.sim_run or not st.session_state.states:
-    st.markdown("""
-    <div style="text-align:center; padding: 60px 20px;">
-      <div style="font-size:5rem;">🚁</div>
-      <div style="font-family:'Share Tech Mono',monospace; color:#1E40AF; font-size:1.1rem; margin-top:12px;">
-        CONFIGURE MISSION PARAMETERS IN SIDEBAR<br>
-        <span style="color:#475569; font-size:0.85rem;">THEN PRESS ▶ RUN SIMULATION</span>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.stop()
-
-
-# ===========================================================================
-# EXTRACT SIMULATION DATA
-# ===========================================================================
-
-states: list[DroneState] = st.session_state.states
-env: Environment = st.session_state.environment
-path = st.session_state.path
-n_frames = len(states)
-
-# Build arrays for plotting
-positions  = np.array([s.position for s in states])
-velocities = np.array([s.velocity for s in states])
-speeds     = np.array([s.speed()  for s in states])
-altitudes  = positions[:, 2]
-batteries  = np.array([s.battery  for s in states])
-timestamps = np.array([s.timestamp for s in states])
-yaws       = np.array([s.yaw      for s in states])
-pitches    = np.array([s.pitch    for s in states])
-motor_rpms = np.array([s.motor_rpm for s in states])
-thrusts    = np.array([s.thrust   for s in states])
-
-# Nearest obstacle distances
-obs_distances = []
-nfz_flags = []
-for s in states:
-    dist, _ = env.nearest_obstacle_info(s.position)
-    obs_distances.append(dist)
-    nfz_flags.append(env.in_no_fly_zone(s.position))
-obs_distances = np.array(obs_distances)
-nfz_flags = np.array(nfz_flags)
-
-DANGER_DIST  = safety_margin + 0.5
-WARNING_DIST = safety_margin + 3.0
-
-
-# ===========================================================================
-# HUD METRICS ROW
-# ===========================================================================
-
-frame_idx = st.session_state.frame_idx
-cur = states[frame_idx]
-cur_dist = obs_distances[frame_idx]
-
-mc = st.columns(7)
-mc[0].metric("Altitude",    f"{cur.altitude():.1f} m",   f"{cur.altitude() - states[0].altitude():.1f} m")
-mc[1].metric("Speed",       f"{cur.speed():.2f} m/s",    f"{cur.speed() - states[max(0,frame_idx-1)].speed():.2f}")
-mc[2].metric("Battery",     f"{cur.battery:.1f}%",       f"{cur.battery - 100:.1f}%")
-mc[3].metric("Heading",     f"{np.rad2deg(cur.yaw):.0f}°")
-mc[4].metric("Motor RPM",   f"{cur.motor_rpm:,.0f}")
-mc[5].metric("Obs. Dist.",  f"{cur_dist:.1f} m",
-             delta=None if cur_dist > WARNING_DIST else "⚠ CLOSE",
-             delta_color="inverse" if cur_dist < DANGER_DIST else "normal")
-mc[6].metric("Frame",       f"{frame_idx+1}/{n_frames}")
-
-st.markdown("")
-
-
-# ===========================================================================
-# TABS
-# ===========================================================================
-
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🌐  3D Mission View",
-    "📊  Telemetry",
-    "🛡  Collision Monitor",
-    "📋  Mission Report",
-])
-
-
-# ---------------------------------------------------------------------------
-# TAB 1 — 3D MISSION VIEW
-# ---------------------------------------------------------------------------
-
-with tab1:
-    # Frame scrubber
-    frame_idx = st.slider(
-        "🎞  Scrub Timeline",
-        min_value=0,
-        max_value=n_frames - 1,
-        value=st.session_state.frame_idx,
-        key="frame_slider",
-    )
-    st.session_state.frame_idx = frame_idx
-
-    cur_state = states[frame_idx]
-
-    # Get LiDAR for nearest cached frame
-    lidar_pts, lidar_int = None, None
-    if lidar_on and st.session_state.lidar_cache:
-        # Find nearest cached frame
-        cached_frames = sorted(st.session_state.lidar_cache.keys())
-        nearest_cached = min(cached_frames, key=lambda f: abs(f - frame_idx))
-        lidar_pts, lidar_int = st.session_state.lidar_cache[nearest_cached]
-
-    # Build scene
-    fig = build_3d_scene(
-        environment=env,
-        path=path,
-        drone_position=cur_state.position,
-        drone_yaw=cur_state.yaw,
-        lidar_points=lidar_pts if lidar_on else None,
-        lidar_intensities=lidar_int if lidar_on else None,
-        trajectory_history=list(positions[:frame_idx + 1]),
-        trajectory_speeds=list(speeds[:frame_idx + 1]),
-        show_lidar=lidar_on,
-        show_nfz=show_nfz,
-    )
-    st.plotly_chart(fig, use_container_width=True, key="scene3d")
-
-    # Inline alert
-    if nfz_flags[frame_idx]:
-        st.markdown('<div class="alert-danger">⛔  NO-FLY ZONE VIOLATION DETECTED AT THIS FRAME</div>', unsafe_allow_html=True)
-    elif obs_distances[frame_idx] < DANGER_DIST:
-        st.markdown(f'<div class="alert-danger">🚨  COLLISION RISK — Obstacle at {obs_distances[frame_idx]:.1f} m</div>', unsafe_allow_html=True)
-    elif obs_distances[frame_idx] < WARNING_DIST:
-        st.markdown(f'<div class="alert-warning">⚠️  Obstacle proximity warning — {obs_distances[frame_idx]:.1f} m</div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="alert-ok">✅  Clear — Nearest obstacle {obs_distances[frame_idx]:.1f} m away</div>', unsafe_allow_html=True)
-
-
-# ---------------------------------------------------------------------------
-# TAB 2 — TELEMETRY
-# ---------------------------------------------------------------------------
-
-with tab2:
-    t_arr = timestamps
-
-    c1, c2 = st.columns(2)
-
-    # --- Altitude ---
-    with c1:
-        fig_alt = go.Figure()
-        fig_alt.add_trace(go.Scatter(
-            x=t_arr, y=altitudes,
-            mode="lines",
-            line=dict(color="#00D4FF", width=2),
-            name="Altitude",
-            fill="tozeroy",
-            fillcolor="rgba(0, 212, 255, 0.08)",
-        ))
-        fig_alt.add_vline(
-            x=t_arr[frame_idx], line_dash="dash",
-            line_color="#A855F7", line_width=1.5,
-        )
-        fig_alt.update_layout(
-            title=dict(text="Altitude (m)", font=dict(color="#00D4FF", size=13)),
-            paper_bgcolor="#080816", plot_bgcolor="#080816",
-            font=dict(color="#94A3B8"),
-            xaxis=dict(title="Time (s)", gridcolor="#0e0e2c"),
-            yaxis=dict(title="m", gridcolor="#0e0e2c"),
-            height=260, margin=dict(l=40, r=10, t=40, b=30),
-        )
-        st.plotly_chart(fig_alt, use_container_width=True)
-
-    # --- Speed ---
-    with c2:
-        fig_spd = go.Figure()
-        fig_spd.add_trace(go.Scatter(
-            x=t_arr, y=speeds,
-            mode="lines",
-            line=dict(color="#F59E0B", width=2),
-            name="Speed",
-            fill="tozeroy",
-            fillcolor="rgba(245, 158, 11, 0.08)",
-        ))
-        fig_spd.add_hline(
-            y=drone_max_speed, line_dash="dot",
-            line_color="#EF4444", line_width=1,
-            annotation_text="Max Speed",
-            annotation_font_color="#EF4444",
-        )
-        fig_spd.add_vline(
-            x=t_arr[frame_idx], line_dash="dash",
-            line_color="#A855F7", line_width=1.5,
-        )
-        fig_spd.update_layout(
-            title=dict(text="Speed (m/s)", font=dict(color="#F59E0B", size=13)),
-            paper_bgcolor="#080816", plot_bgcolor="#080816",
-            font=dict(color="#94A3B8"),
-            xaxis=dict(title="Time (s)", gridcolor="#0e0e2c"),
-            yaxis=dict(title="m/s", gridcolor="#0e0e2c"),
-            height=260, margin=dict(l=40, r=10, t=40, b=30),
-        )
-        st.plotly_chart(fig_spd, use_container_width=True)
-
-    c3, c4 = st.columns(2)
-
-    # --- Battery ---
-    with c3:
-        # Colour by level
-        bat_colors = ["#10B981" if b > 40 else "#F59E0B" if b > 15 else "#EF4444"
-                      for b in batteries]
-        fig_bat = go.Figure()
-        fig_bat.add_trace(go.Scatter(
-            x=t_arr, y=batteries,
-            mode="lines",
-            line=dict(color="#10B981", width=2),
-            name="Battery",
-            fill="tozeroy",
-            fillcolor="rgba(16, 185, 129, 0.08)",
-        ))
-        fig_bat.add_hline(y=20, line_dash="dot", line_color="#EF4444", line_width=1,
-                          annotation_text="Low Battery", annotation_font_color="#EF4444")
-        fig_bat.add_vline(x=t_arr[frame_idx], line_dash="dash",
-                          line_color="#A855F7", line_width=1.5)
-        fig_bat.update_layout(
-            title=dict(text="Battery (%)", font=dict(color="#10B981", size=13)),
-            paper_bgcolor="#080816", plot_bgcolor="#080816",
-            font=dict(color="#94A3B8"),
-            xaxis=dict(title="Time (s)", gridcolor="#0e0e2c"),
-            yaxis=dict(title="%", range=[0, 105], gridcolor="#0e0e2c"),
-            height=260, margin=dict(l=40, r=10, t=40, b=30),
-        )
-        st.plotly_chart(fig_bat, use_container_width=True)
-
-    # --- Motor RPM + Thrust ---
-    with c4:
-        fig_rpm = go.Figure()
-        fig_rpm.add_trace(go.Scatter(
-            x=t_arr, y=motor_rpms,
-            mode="lines",
-            line=dict(color="#A855F7", width=2),
-            name="Motor RPM",
-            yaxis="y1",
-        ))
-        fig_rpm.add_trace(go.Scatter(
-            x=t_arr, y=thrusts,
-            mode="lines",
-            line=dict(color="#EC4899", width=1.5, dash="dot"),
-            name="Thrust (N)",
-            yaxis="y2",
-        ))
-        fig_rpm.add_vline(x=t_arr[frame_idx], line_dash="dash",
-                          line_color="#00D4FF", line_width=1.5)
-        fig_rpm.update_layout(
-            title=dict(text="Motor RPM / Thrust", font=dict(color="#A855F7", size=13)),
-            paper_bgcolor="#080816", plot_bgcolor="#080816",
-            font=dict(color="#94A3B8"),
-            xaxis=dict(title="Time (s)", gridcolor="#0e0e2c"),
-            yaxis=dict(title="RPM", gridcolor="#0e0e2c"),
-            yaxis2=dict(title="Thrust (N)", overlaying="y", side="right", gridcolor="#0e0e2c"),
-            legend=dict(bgcolor="rgba(0,0,0,0.5)"),
-            height=260, margin=dict(l=40, r=50, t=40, b=30),
-        )
-        st.plotly_chart(fig_rpm, use_container_width=True)
-
-    # --- 3D Velocity Phase Portrait ---
-    st.markdown("#### Velocity Phase Portrait")
-    vx = velocities[:, 0]
-    vy = velocities[:, 1]
-    vz = velocities[:, 2]
-    fig_phase = go.Figure(go.Scatter3d(
-        x=vx, y=vy, z=vz,
-        mode="lines",
-        line=dict(color=speeds, colorscale="Plasma", width=3, cmin=0, cmax=float(drone_max_speed)),
-        hoverinfo="skip",
-    ))
-    fig_phase.update_layout(
-        scene=dict(
-            xaxis=dict(title="Vx", backgroundcolor="#080816", gridcolor="#0e0e2c"),
-            yaxis=dict(title="Vy", backgroundcolor="#080816", gridcolor="#0e0e2c"),
-            zaxis=dict(title="Vz", backgroundcolor="#080816", gridcolor="#0e0e2c"),
-            bgcolor="#080816",
-        ),
-        paper_bgcolor="#080816", font=dict(color="#94A3B8"),
-        height=380, margin=dict(l=0, r=0, t=10, b=0),
-    )
-    st.plotly_chart(fig_phase, use_container_width=True)
-
-
-# ---------------------------------------------------------------------------
-# TAB 3 — COLLISION MONITOR
-# ---------------------------------------------------------------------------
-
-with tab3:
-    col_a, col_b = st.columns([3, 1])
-
+    # ── Mission control ───────────────────────────────────────────────────────
+    st.markdown('<div class="panel-title">▶ MISSION CONTROL</div>', unsafe_allow_html=True)
+    col_a, col_b = st.columns(2)
     with col_a:
-        # Proximity time-series
-        fig_prox = go.Figure()
-        fig_prox.add_hrect(
-            y0=0, y1=DANGER_DIST,
-            fillcolor="rgba(220,38,38,0.12)", line_width=0,
-            annotation_text="DANGER ZONE", annotation_font_color="#EF4444",
-        )
-        fig_prox.add_hrect(
-            y0=DANGER_DIST, y1=WARNING_DIST,
-            fillcolor="rgba(245,158,11,0.08)", line_width=0,
-            annotation_text="WARNING ZONE", annotation_font_color="#F59E0B",
-        )
-        fig_prox.add_trace(go.Scatter(
-            x=t_arr, y=obs_distances,
-            mode="lines",
-            line=dict(color="#00D4FF", width=2),
-            name="Nearest Obstacle",
-            fill="tozeroy",
-            fillcolor="rgba(0,212,255,0.05)",
-        ))
-        fig_prox.add_vline(
-            x=t_arr[frame_idx], line_dash="dash",
-            line_color="#A855F7", line_width=2,
-        )
-        fig_prox.update_layout(
-            title=dict(text="Nearest Obstacle Distance (m)", font=dict(color="#00D4FF", size=13)),
-            paper_bgcolor="#080816", plot_bgcolor="#080816",
-            font=dict(color="#94A3B8"),
-            xaxis=dict(title="Time (s)", gridcolor="#0e0e2c"),
-            yaxis=dict(title="Distance (m)", gridcolor="#0e0e2c"),
-            height=320, margin=dict(l=40, r=10, t=40, b=30),
-        )
-        st.plotly_chart(fig_prox, use_container_width=True)
-
-        # NFZ violation timeline
-        if nfz_flags.any():
-            fig_nfz = go.Figure()
-            fig_nfz.add_trace(go.Scatter(
-                x=t_arr, y=nfz_flags.astype(int),
-                mode="lines",
-                line=dict(color="#EF4444", width=2),
-                fill="tozeroy",
-                fillcolor="rgba(239,68,68,0.15)",
-                name="NFZ Violation",
-            ))
-            fig_nfz.update_layout(
-                title=dict(text="No-Fly Zone Violations", font=dict(color="#EF4444", size=13)),
-                paper_bgcolor="#080816", plot_bgcolor="#080816",
-                font=dict(color="#94A3B8"),
-                xaxis=dict(title="Time (s)", gridcolor="#0e0e2c"),
-                yaxis=dict(title="Violation (0/1)", range=[-0.1, 1.5], gridcolor="#0e0e2c"),
-                height=180, margin=dict(l=40, r=10, t=40, b=30),
-            )
-            st.plotly_chart(fig_nfz, use_container_width=True)
-
+        if st.button("🚀  LAUNCH" if not st.session_state.sim_running else "⏸  PAUSE"):
+            st.session_state.sim_running = not st.session_state.sim_running
     with col_b:
-        st.markdown("#### ⚠ Alert Summary")
+        if st.button("⟳  RESET"):
+            for key in ["drones","physics","pso","found_idx","sim_running",
+                        "frame_count","lidar_pts","lidar_dists","alerts",
+                        "active_keys","mission_start_time","lidar_frame_counter"]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
 
-        danger_frames  = np.sum(obs_distances < DANGER_DIST)
-        warning_frames = np.sum((obs_distances >= DANGER_DIST) & (obs_distances < WARNING_DIST))
-        nfz_frames     = np.sum(nfz_flags)
-        min_sep        = float(obs_distances.min())
+    run_status = "● RUNNING" if st.session_state.sim_running else "◼ STOPPED"
+    status_class = "badge-ok" if st.session_state.sim_running else "badge-warn"
+    st.markdown(f'<span class="badge {status_class}">{run_status}</span>', unsafe_allow_html=True)
 
-        if danger_frames > 0:
-            st.markdown(f'<div class="alert-danger">🚨 COLLISION RISK<br>{danger_frames} frames in danger zone</div>', unsafe_allow_html=True)
-        if warning_frames > 0:
-            st.markdown(f'<div class="alert-warning">⚠️ PROXIMITY<br>{warning_frames} frames in warning zone</div>', unsafe_allow_html=True)
-        if nfz_frames > 0:
-            st.markdown(f'<div class="alert-danger">⛔ NFZ VIOLATION<br>{nfz_frames} frames</div>', unsafe_allow_html=True)
-        if danger_frames == 0 and warning_frames == 0 and nfz_frames == 0:
-            st.markdown('<div class="alert-ok">✅ NO ALERTS<br>Mission within safe parameters</div>', unsafe_allow_html=True)
+    st.markdown("---")
 
-        st.markdown("---")
-        st.metric("Min Separation", f"{min_sep:.2f} m",
-                  delta="DANGER" if min_sep < DANGER_DIST else ("WARNING" if min_sep < WARNING_DIST else "SAFE"),
-                  delta_color="inverse" if min_sep < DANGER_DIST else "normal")
-        st.metric("Danger Frames",  f"{danger_frames}")
-        st.metric("Warning Frames", f"{warning_frames}")
-        st.metric("NFZ Violations", f"{nfz_frames}")
+    # ── Simulation settings ───────────────────────────────────────────────────
+    st.markdown('<div class="panel-title">▶ SIM SETTINGS</div>', unsafe_allow_html=True)
+    st.session_state.sim_speed = st.slider(
+        "Sim Speed ×", 0.25, 4.0, st.session_state.sim_speed, 0.25
+    )
+    st.session_state.dt = st.select_slider(
+        "Physics dt (s)", [0.04, 0.06, 0.08, 0.10, 0.15], value=0.08
+    )
 
-    # --- Obstacle proximity map (2D top-down)
-    st.markdown("#### Top-Down Proximity Map (XY Plane)")
-    fig_2d = go.Figure()
+    scene_seed = st.number_input("Environment Seed", 0, 9999, 42, step=1)
+    show_trails   = st.toggle("Show Flight Trails",  value=True)
+    show_nfz      = st.toggle("Show PSO Particles",  value=True)
+    show_lidar    = st.toggle("Show LiDAR Cloud",    value=True)
 
-    # Plot obstacle footprints
-    for obs in env.obstacles:
-        theta = np.linspace(0, 2 * np.pi, 60)
-        if obs.obstacle_type == "cylinder":
-            fig_2d.add_trace(go.Scatter(
-                x=obs.center[0] + obs.radius * np.cos(theta),
-                y=obs.center[1] + obs.radius * np.sin(theta),
-                fill="toself", fillcolor="rgba(220,38,38,0.3)",
-                line=dict(color=obs.color, width=1),
-                showlegend=False, hoverinfo="skip",
-            ))
+    st.markdown("---")
+
+    # ── Drone control ─────────────────────────────────────────────────────────
+    st.markdown('<div class="panel-title">▶ DRONE CONTROL</div>', unsafe_allow_html=True)
+
+    st.session_state.manual_mode = st.toggle(
+        "🎮  Manual Control — UAV-1",
+        value=st.session_state.manual_mode
+    )
+
+    if st.session_state.manual_mode:
+        st.markdown(
+            '<div class="badge badge-info">UAV-1 IN MANUAL MODE</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            '<div class="badge badge-ok">UAV-1 AUTONOMOUS</div>',
+            unsafe_allow_html=True
+        )
+
+    st.markdown("---")
+
+    # ── Algorithm weights ─────────────────────────────────────────────────────
+    st.markdown('<div class="panel-title">▶ ALGORITHM WEIGHTS</div>', unsafe_allow_html=True)
+    alpha_apf = st.slider("α  APF Weight",  0.0, 1.0, 0.55, 0.05)
+    beta_pso  = st.slider("β  PSO Weight",  0.0, 1.0, 0.30, 0.05)
+    gamma_sep = st.slider("γ  Sep Weight",  0.0, 1.0, 0.15, 0.05)
+
+    st.markdown("---")
+
+    # ── Alerts log ────────────────────────────────────────────────────────────
+    st.markdown('<div class="panel-title">▶ MISSION LOG</div>', unsafe_allow_html=True)
+    for alert in st.session_state.alerts:
+        st.markdown(f'<div class="alert-box alert-found">{alert}</div>',
+                    unsafe_allow_html=True)
+    if not st.session_state.alerts:
+        st.markdown(
+            '<div class="alert-box alert-warn">◌  Awaiting contact…</div>',
+            unsafe_allow_html=True
+        )
+
+    # ── Mission progress ──────────────────────────────────────────────────────
+    st.markdown("---")
+    scene_ref, _ = _get_scene_and_obstacles()
+    n_total  = len(scene_ref.survivors)
+    n_found  = len(st.session_state.found_idx)
+    st.markdown(
+        f'<div class="panel-title">▶ MISSION PROGRESS  '
+        f'<span style="color:#00C8FF">{n_found}/{n_total}</span></div>',
+        unsafe_allow_html=True
+    )
+    st.progress(n_found / max(n_total, 1))
+
+    elapsed = (
+        int(time.time() - st.session_state.mission_start_time)
+        if st.session_state.mission_start_time else 0
+    )
+    st.markdown(
+        f'<div style="font-family:\'Share Tech Mono\',monospace;font-size:0.68rem;'
+        f'color:#2A5A80;">ELAPSED: {elapsed//60:02d}:{elapsed%60:02d}  |  '
+        f'FRAME: {st.session_state.frame_count:05d}</div>',
+        unsafe_allow_html=True
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  KEYBOARD LISTENER INJECTION + HIDDEN INPUT READER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Inject the JS keyboard listener (runs in browser iframe)
+components.html(KEYBOARD_JS, height=0)
+
+# Hidden text input that JS writes into (placeholder acts as an ID)
+raw_keys = st.text_input(
+    label="keys",
+    value="",
+    key="raw_key_input",
+    label_visibility="hidden",
+    placeholder="__sar_keys__",
+)
+
+# Parse the key string into a set
+if raw_keys:
+    st.session_state.active_keys = set(k.strip() for k in raw_keys.split(",") if k.strip())
+else:
+    st.session_state.active_keys = set()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ON-SCREEN D-PAD (reliable fallback + complement to keyboard)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_dpad():
+    """
+    Render the on-screen D-pad controller using styled Streamlit buttons.
+    Each button adds/removes a virtual key from active_keys.
+    """
+    if not st.session_state.manual_mode:
+        return
+
+    active = st.session_state.active_keys
+
+    row0 = st.columns([1, 1, 1, 1, 1, 1, 1])
+    with row0[0]:
+        st.markdown("**🎮 D-PAD**", help="Click buttons OR use WASD/Arrow keys")
+
+    # Row 1: Ascend + Forward
+    r1c1, r1c2, r1c3, r1c4, r1c5 = st.columns([1, 1, 1, 1, 1])
+    with r1c2:
+        if st.button("▲\nASC", key="dp_asc", help="Ascend [R/Space]"):
+            st.session_state.active_keys ^= {'r'}
+    with r1c3:
+        if st.button("↑\nFWD", key="dp_fwd", help="Forward [W/↑]"):
+            st.session_state.active_keys ^= {'w'}
+    with r1c4:
+        if st.button("↺\nYAW L", key="dp_yawr", help="Yaw Left [Q]"):
+            st.session_state.active_keys ^= {'q'}
+
+    # Row 2: Left + Hold + Right
+    r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns([1, 1, 1, 1, 1])
+    with r2c1:
+        pass
+    with r2c2:
+        if st.button("←\nLFT", key="dp_left", help="Strafe Left [A/←]"):
+            st.session_state.active_keys ^= {'a'}
+    with r2c3:
+        if st.button("■\nHLD", key="dp_hold", help="Hold Position [H]"):
+            st.session_state.active_keys = set()
+    with r2c4:
+        if st.button("→\nRGT", key="dp_right", help="Strafe Right [D/→]"):
+            st.session_state.active_keys ^= {'d'}
+    with r2c5:
+        pass
+
+    # Row 3: Descend + Backward
+    r3c1, r3c2, r3c3, r3c4, r3c5 = st.columns([1, 1, 1, 1, 1])
+    with r3c2:
+        if st.button("▼\nDSC", key="dp_dsc", help="Descend [F/Shift]"):
+            st.session_state.active_keys ^= {'f'}
+    with r3c3:
+        if st.button("↓\nBCK", key="dp_bck", help="Backward [S/↓]"):
+            st.session_state.active_keys ^= {'s'}
+    with r3c4:
+        if st.button("↻\nYAW R", key="dp_yawr2", help="Yaw Right [E]"):
+            st.session_state.active_keys ^= {'e'}
+
+    # Key state indicator
+    if active:
+        keys_str = " + ".join(k.upper()[:3] for k in sorted(active))
+        st.markdown(
+            f'<div class="badge badge-info">KEYS: {keys_str}</div>',
+            unsafe_allow_html=True
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RUN SIMULATION STEP (if running)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if st.session_state.sim_running:
+    simulation_step()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HEADER ROW — Title + HUD Metrics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+header_left, header_right = st.columns([2, 3])
+
+with header_left:
+    st.markdown(
+        '<div class="app-title">🛩 SAR MULTI-UAV SIMULATION</div>'
+        '<div class="app-sub">FLOOD RESCUE · APF-PSO-VORTEX HYBRID NAVIGATION · 3-DRONE FLEET</div>',
+        unsafe_allow_html=True
+    )
+
+with header_right:
+    scene_ref, _ = _get_scene_and_obstacles()
+    drones_now   = st.session_state.drones
+    mc = st.columns(6)
+    mc[0].metric("UAV-1 Alt",  f"{drones_now[0].altitude:.1f}m",
+                 f"{drones_now[0].speed:.1f}m/s")
+    mc[1].metric("UAV-2 Alt",  f"{drones_now[1].altitude:.1f}m",
+                 f"{drones_now[1].speed:.1f}m/s")
+    mc[2].metric("UAV-3 Alt",  f"{drones_now[2].altitude:.1f}m",
+                 f"{drones_now[2].speed:.1f}m/s")
+    mc[3].metric("Survivors",
+                 f"{len(st.session_state.found_idx)}/{len(scene_ref.survivors)}",
+                 delta=f"+{len(st.session_state.found_idx)}" if st.session_state.found_idx else None)
+    mc[4].metric("UAV-1 Bat",  f"{drones_now[0].battery:.0f}%")
+    mc[5].metric("Mode",
+                 "MANUAL" if st.session_state.manual_mode else "AUTO",
+                 delta="UAV-1")
+
+st.markdown("<hr style='margin:4px 0 6px 0;'>", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  THREE-PANEL LAYOUT
+#  Left (60%): Main 3D Scene + D-Pad
+#  Right (40%): Top — Tactical Map | Bottom — Sensor Panel
+# ═══════════════════════════════════════════════════════════════════════════════
+
+col_left, col_right = st.columns([3, 2], gap="small")
+
+# ── Retrieve current state ─────────────────────────────────────────────────────
+scene_now, obstacles_now = _get_scene_and_obstacles()
+drones_now   = st.session_state.drones
+pso_now      = st.session_state.pso
+found_now    = st.session_state.found_idx
+
+
+# ── LEFT PANEL: Main 3D Scene ──────────────────────────────────────────────────
+with col_left:
+    st.markdown('<div class="panel-title">◈ MAIN 3D SCENE — FLOOD SAR ENVIRONMENT</div>',
+                unsafe_allow_html=True)
+
+    main_fig = build_main_scene(
+        scene    = scene_now,
+        drones   = drones_now,
+        found_idx= found_now,
+        cam_eye  = st.session_state.cam_eye,
+    )
+    st.plotly_chart(main_fig, use_container_width=True, key="main_scene")
+
+    st.markdown("<hr style='margin:4px 0;'>", unsafe_allow_html=True)
+
+    # ── D-Pad + telemetry row ──────────────────────────────────────────────────
+    dp_col, telem_col = st.columns([2, 3])
+
+    with dp_col:
+        if st.session_state.manual_mode:
+            st.markdown('<div class="panel-title">🎮 MANUAL CONTROL — UAV-1</div>',
+                        unsafe_allow_html=True)
+            render_dpad()
         else:
-            hs = obs.radius
-            cx, cy = obs.center[0], obs.center[1]
-            fig_2d.add_trace(go.Scatter(
-                x=[cx-hs, cx+hs, cx+hs, cx-hs, cx-hs],
-                y=[cy-hs, cy-hs, cy+hs, cy+hs, cy-hs],
-                fill="toself", fillcolor="rgba(180,100,0,0.3)",
-                line=dict(color=obs.color, width=1),
-                showlegend=False, hoverinfo="skip",
-            ))
+            st.markdown('<div class="panel-title">⚙ ALGORITHM WEIGHTS</div>',
+                        unsafe_allow_html=True)
+            # Show force magnitude bars for drone 0
+            d0 = drones_now[0]
+            for fname, fvec, col_ in [
+                ("F_att",  d0.f_apf_att, "#00FF88"),
+                ("F_rep",  d0.f_apf_rep, "#FF4040"),
+                ("F_vort", d0.f_vortex,  "#FF8C00"),
+                ("F_pso",  d0.f_pso,     "#A0A0FF"),
+            ]:
+                mag = float(norm(fvec))
+                bar = int(min(mag / 12.0 * 100, 100))
+                st.markdown(
+                    f'<div style="font-family:\'Share Tech Mono\',monospace;'
+                    f'font-size:0.68rem;color:{col_};">'
+                    f'{fname}: {mag:5.2f}N '
+                    f'<span style="background:{col_};width:{bar}px;height:6px;'
+                    f'display:inline-block;border-radius:2px;vertical-align:middle;"></span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
-    # NFZs
-    for nfz in env.no_fly_zones:
-        theta = np.linspace(0, 2 * np.pi, 60)
-        fig_2d.add_trace(go.Scatter(
-            x=nfz.center[0] + nfz.radius * np.cos(theta),
-            y=nfz.center[1] + nfz.radius * np.sin(theta),
-            fill="toself", fillcolor="rgba(239,68,68,0.08)",
-            line=dict(color="#EF4444", width=1, dash="dot"),
-            showlegend=False, hoverinfo="skip",
-        ))
+    with telem_col:
+        st.markdown('<div class="panel-title">📡 TELEMETRY</div>', unsafe_allow_html=True)
+        # Per-drone telemetry table
+        telem_cols = st.columns(3)
+        drone_icons = ["🔵", "🟢", "🟡"]
+        for d_idx, (dc, icon) in enumerate(zip(drones_now, drone_icons)):
+            with telem_cols[d_idx]:
+                target_str = (
+                    f"→ SUR-{dc.target_idx+1:02d}"
+                    if dc.target_idx is not None else "→ BASE"
+                )
+                mode_str = "MAN" if dc.mode == "manual" else "APF"
+                bat_color = "#00FF80" if dc.battery > 40 else ("#FFA020" if dc.battery > 15 else "#FF3040")
+                st.markdown(
+                    f'<div style="background:rgba(8,20,40,0.9);border:1px solid #0A3060;'
+                    f'border-radius:3px;padding:6px;font-family:\'Share Tech Mono\',monospace;'
+                    f'font-size:0.68rem;">'
+                    f'<div style="color:#00C8FF;">{icon} UAV-{d_idx+1} [{mode_str}]</div>'
+                    f'<div style="color:#7BAFC8;">X: {dc.position[0]:+6.1f}m</div>'
+                    f'<div style="color:#7BAFC8;">Y: {dc.position[1]:+6.1f}m</div>'
+                    f'<div style="color:#7BAFC8;">Z: {dc.position[2]:5.1f}m</div>'
+                    f'<div style="color:#7BAFC8;">V: {dc.speed:5.2f}m/s</div>'
+                    f'<div style="color:{bat_color};">⚡ {dc.battery:4.0f}%</div>'
+                    f'<div style="color:#FFA020;">{target_str}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
-    # Path
-    if path:
-        pa = np.array(path)
-        fig_2d.add_trace(go.Scatter(
-            x=pa[:, 0], y=pa[:, 1],
-            mode="lines",
-            line=dict(color="#00D4FF", width=2, dash="dash"),
-            name="Path",
-        ))
 
-    # Trail up to current frame
-    fig_2d.add_trace(go.Scatter(
-        x=positions[:frame_idx+1, 0], y=positions[:frame_idx+1, 1],
-        mode="lines",
-        line=dict(color="#F59E0B", width=3),
-        name="Flown",
-    ))
+# ── RIGHT PANEL: Top = Tactical Map, Bottom = Sensor ──────────────────────────
+with col_right:
 
-    # Current drone position
-    fig_2d.add_trace(go.Scatter(
-        x=[positions[frame_idx, 0]], y=[positions[frame_idx, 1]],
-        mode="markers",
-        marker=dict(size=12, color="#A855F7", symbol="diamond"),
-        name="Drone",
-    ))
+    # ── TOP RIGHT: Tactical Map (top-down view) ────────────────────────────────
+    st.markdown('<div class="panel-title">◈ TACTICAL MAP — TOP-DOWN / FPV</div>',
+                unsafe_allow_html=True)
 
-    fig_2d.update_layout(
-        paper_bgcolor="#080816", plot_bgcolor="#080816",
-        font=dict(color="#94A3B8"),
-        xaxis=dict(title="X (m)", range=[0, env_size], gridcolor="#0e0e2c",
-                   scaleanchor="y", scaleratio=1),
-        yaxis=dict(title="Y (m)", range=[0, env_size], gridcolor="#0e0e2c"),
-        height=420, margin=dict(l=40, r=10, t=10, b=30),
-        legend=dict(bgcolor="rgba(0,0,0,0.5)"),
+    tac_fig = build_tactical_map(
+        scene      = scene_now,
+        drones     = drones_now,
+        found_idx  = found_now,
+        pso_states = pso_now if show_nfz else [],
+        obstacles  = obstacles_now,
     )
-    st.plotly_chart(fig_2d, use_container_width=True)
+    st.plotly_chart(tac_fig, use_container_width=True, key="tac_map")
 
+    # ── BOTTOM RIGHT: Sensor Panel (LiDAR + APF/Vortex Field) ─────────────────
+    st.markdown('<div class="panel-title">◈ SENSOR DATA — LiDAR · APF · VORTEX FIELD</div>',
+                unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# TAB 4 — MISSION REPORT
-# ---------------------------------------------------------------------------
-
-with tab4:
-    total_time  = float(timestamps[-1])
-    total_dist  = float(np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1)))
-    avg_speed   = float(speeds.mean())
-    max_speed_  = float(speeds.max())
-    max_alt     = float(altitudes.max())
-    bat_used    = float(100.0 - batteries[-1])
-    path_len    = float(sum(np.linalg.norm(np.array(path[i+1]) - np.array(path[i]))
-                            for i in range(len(path)-1))) if path else 0.0
-
-    st.markdown("### 📋 Mission Summary")
-    r1, r2, r3 = st.columns(3)
-
-    with r1:
-        st.markdown("**Flight Statistics**")
-        st.markdown(f"""
-| Parameter | Value |
-|---|---|
-| Total Flight Time | {total_time:.1f} s |
-| Distance Covered | {total_dist:.1f} m |
-| Avg Speed | {avg_speed:.2f} m/s |
-| Max Speed | {max_speed_:.2f} m/s |
-| Max Altitude | {max_alt:.1f} m |
-| Battery Used | {bat_used:.1f}% |
-""")
-
-    with r2:
-        st.markdown("**Path Planning**")
-        st.markdown(f"""
-| Parameter | Value |
-|---|---|
-| Planning Time | {st.session_state.plan_time*1000:.0f} ms |
-| Path Waypoints | {len(path)} |
-| Path Length | {path_len:.1f} m |
-| Planner Resolution | {planner_res} m |
-| Safety Margin | {safety_margin} m |
-| Algorithm | A* + Cubic Spline |
-""")
-
-    with r3:
-        st.markdown("**Safety Assessment**")
-        mission_status = "✅ SAFE" if (danger_frames == 0 and nfz_frames == 0) else "⚠️ VIOLATIONS"
-        st.markdown(f"""
-| Parameter | Value |
-|---|---|
-| Mission Status | {mission_status} |
-| Min Obstacle Sep. | {min_sep:.2f} m |
-| Danger Frames | {danger_frames} ({danger_frames/n_frames*100:.1f}%) |
-| Warning Frames | {warning_frames} ({warning_frames/n_frames*100:.1f}%) |
-| NFZ Violations | {nfz_frames} frames |
-| Obstacles in Env | {len(env.obstacles)} |
-""")
-
-    st.markdown("---")
-    st.markdown("### 🔧 Configuration Used")
-    cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
-
-    with cfg_col1:
-        st.markdown("**Drone Hardware**")
-        st.json({
-            "mass_kg": drone_mass,
-            "max_speed_ms": drone_max_speed,
-            "max_thrust_N": drone_max_thrust,
-            "drag_coefficient": drag_coeff,
-        })
-
-    with cfg_col2:
-        st.markdown("**Environment**")
-        st.json({
-            "world_size_m": env_size,
-            "max_altitude_m": env_height,
-            "cylinder_buildings": n_cylinders,
-            "box_structures": n_boxes,
-            "no_fly_zones": n_nfz,
-            "seed": int(env_seed),
-        })
-
-    with cfg_col3:
-        st.markdown("**Simulation**")
-        st.json({
-            "timestep_s": sim_dt,
-            "wind_force_N": wind_intensity,
-            "lidar_enabled": lidar_on,
-            "lidar_range_m": lidar_range if lidar_on else "N/A",
-            "total_sim_frames": n_frames,
-        })
-
-    # Download flight log
-    st.markdown("---")
-    st.markdown("### 📥 Export Flight Log")
-    log_df = pd.DataFrame({
-        "time_s":     timestamps,
-        "x_m":        positions[:, 0],
-        "y_m":        positions[:, 1],
-        "z_m":        positions[:, 2],
-        "speed_ms":   speeds,
-        "yaw_rad":    yaws,
-        "pitch_rad":  pitches,
-        "battery_pct":batteries,
-        "motor_rpm":  motor_rpms,
-        "thrust_N":   thrusts,
-        "obs_dist_m": obs_distances,
-        "nfz_flag":   nfz_flags.astype(int),
-    })
-    st.download_button(
-        label="⬇️  Download Flight Log (CSV)",
-        data=log_df.to_csv(index=False),
-        file_name="uav_flight_log.csv",
-        mime="text/csv",
+    sensor_fig = build_sensor_panel(
+        drones     = drones_now,
+        lidar_pts  = st.session_state.lidar_pts  if show_lidar else None,
+        lidar_dists= st.session_state.lidar_dists if show_lidar else None,
+        obstacles  = obstacles_now,
+        found_idx  = found_now,
+        scene      = scene_now,
     )
+    st.plotly_chart(sensor_fig, use_container_width=True, key="sensor_panel")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  KEYBOARD LEGEND (full-width, below panels)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("<hr style='margin:4px 0;'>", unsafe_allow_html=True)
+
+legend_html = """
+<div style="
+  font-family:'Share Tech Mono',monospace;
+  font-size:0.65rem;
+  color:#1A4870;
+  display:flex;
+  gap:20px;
+  flex-wrap:wrap;
+  padding:4px 0;
+">
+  <span>🎮 <span style="color:#00C8FF">UAV-1 MANUAL:</span></span>
+  <span><kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">W</kbd> / <kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">↑</kbd> Forward</span>
+  <span><kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">S</kbd> / <kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">↓</kbd> Backward</span>
+  <span><kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">A</kbd> / <kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">←</kbd> Left</span>
+  <span><kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">D</kbd> / <kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">→</kbd> Right</span>
+  <span><kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">R</kbd> / <kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">SPACE</kbd> Ascend</span>
+  <span><kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">F</kbd> / <kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">SHIFT</kbd> Descend</span>
+  <span><kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">Q</kbd>/<kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">E</kbd> Yaw</span>
+  <span><kbd style="background:#0A2040;border:1px solid #1A4880;border-radius:2px;padding:1px 4px;color:#00C8FF;">H</kbd> Hold</span>
+  <span style="margin-left:auto;color:#0A3060;">UAV-2 &amp; UAV-3 run APF-PSO-VORTEX autonomously</span>
+</div>
+"""
+st.markdown(legend_html, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTO-REFRESH — Drive the simulation loop
+#  Uses time.sleep + st.rerun() — standard Streamlit simulation pattern.
+#  Refresh interval is set by sim_speed (0.25x → ~200ms, 4x → ~25ms).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if st.session_state.sim_running:
+    base_interval = 0.08    # seconds at 1× speed
+    interval = base_interval / max(st.session_state.sim_speed, 0.25)
+    time.sleep(max(interval, 0.04))   # floor at 25 FPS
+    st.rerun()
